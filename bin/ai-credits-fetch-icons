@@ -1,0 +1,10 @@
+#!/bin/bash
+# Достаёт иконки для меню-бара из установленных приложений (Claude, Muse) и с сайта Dust.
+# Сами иконки в репозиторий не входят: это товарные знаки их владельцев.
+set -e
+DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ai-credits/icons"
+mkdir -p "$DIR"
+sips -s format png -Z 128 /Applications/Claude.app/Contents/Resources/electron.icns --out "$DIR/claude.png" >/dev/null
+sips -s format png -Z 128 /Applications/Muse.app/Contents/Resources/AppIcon.icns --out "$DIR/muse.png" >/dev/null
+curl -fsSL -o "$DIR/dust.png" https://dust.tt/static/AppIcon_192.png && sips -Z 128 "$DIR/dust.png" >/dev/null
+echo "Иконки сохранены в $DIR"

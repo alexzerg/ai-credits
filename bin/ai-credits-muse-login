@@ -1,0 +1,11 @@
+#!/bin/bash
+# Запускает `muse login` в отдельном окне Terminal (нужен device-code вход Meta).
+set -uo pipefail
+
+MUSE_BIN="$HOME/.local/bin/muse"
+[ -x "$MUSE_BIN" ] || MUSE_BIN="$(command -v muse 2>/dev/null || echo muse)"
+
+osascript -e "tell application \"Terminal\" to do script \"$MUSE_BIN login\"" \
+          -e 'tell application "Terminal" to activate' >/dev/null 2>&1
+
+echo "Открыт Terminal с '$MUSE_BIN login'. Пройдите вход в браузере."

@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""
+Квота Meta Muse (потребительская подписка muse.ai).
+
+У muse.ai нет публичного usage-API: данные лежат в Next.js server action
+`fetchSubscriptionAction`, id которого меняется на каждом деплое.
+Логика портирована из открытого проекта CodexBar (docs/museai.md).
+
+Куки берём из:
+  1) ~/.config/ai-credits/muse.cookie  — вручную скопированный Cookie-заголовок
+  2) Chrome  (~/Library/Application Support/Google/Chrome/<Profile>/Cookies)
+  3) Safari  (~/Library/Cookies/Cookies.binarycookies)
+
+На stdout — JSON: {"pct": 42, "plan": "...", ...}; при ошибке — {"error": "..."}.
+"""
+
+import base64
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+ORIGIN = "https://muse.ai"
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+ACTION_CACHE = os.path.expanduser("~/.cache/ai-credits/muse_action_id")
+MANUAL_COOKIE = os.path.expanduser("~/.config/ai-credits/muse.cookie")
+TIMEOUT = 20
+
+
+# --------------------------------------------------------------- утилиты
+
+def log(msg):
+    if os.environ.get("AI_CREDITS_DEBUG") == "1":
+        try:
+            with open(os.path.expanduser("~/.cache/ai-credits/debug.log"), "a") as f:
+                f.write("[muse] %s\n" % msg)
+        except OSError:
+            pass
+
+
+def request(method, url, headers=None, body=None, follow=True):
+    """Возвращает (status, headers, body_text)."""
+    req = urllib.request.Request(url, method=method, data=body)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    opener = urllib.request.build_opener()
+    if not follow:
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **kw):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(req, timeout=TIMEOUT) as resp:
+            raw = resp.read()
+            return resp.status, dict(resp.headers), raw.decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        return e.code, dict(e.headers or {}), raw.decode("utf-8", "replace")
+    except Exception as e:  # таймаут, DNS и т.п.
+        log("request failed %s %s: %r" % (method, url, e))
+        return 0, {}, ""
+
+
+# --------------------------------------------------------------- куки
+
+def manual_cookie_header():
+    try:
+        with open(MANUAL_COOKIE, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    raw = re.sub(r"(?i)^cookie:\s*", "", raw).strip()
+    raw = raw.strip('"')
+    return raw if "=" in raw else None
+
+
+def chrome_safe_storage_key():
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "Chrome Safe Storage", "-w"],
+            capture_output=True, timeout=6)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return out.stdout.strip().encode("utf-8")
+    except Exception:
+        return None
+
+
+# --- расшифровка cookie Chrome через системный openssl (AES-128-CBC)
+
+OPENSSL = "/usr/bin/openssl" if os.path.exists("/usr/bin/openssl") else (shutil.which("openssl") or "")
+
+
+def openssl_decrypt_cbc(key16, data):
+    """AES-128-CBC, IV = 16 пробелов. Возвращает сырой plaintext (с PKCS#7)."""
+    if not OPENSSL or not key16 or len(key16) != 16 or not data or len(data) % 16:
+        return None
+    try:
+        p = subprocess.run(
+            [OPENSSL, "enc", "-d", "-aes-128-cbc", "-nopad",
+             "-K", key16.hex(), "-iv", "20" * 16],
+            input=data, capture_output=True, timeout=15)
+    except Exception as e:
+        log("openssl: %r" % e)
+        return None
+    if p.returncode != 0 or not p.stdout:
+        return None
+    out = p.stdout
+    pad = out[-1]
+    if 1 <= pad <= 16 and len(out) >= pad:
+        out = out[:-pad]
+    return out
+
+
+def decrypt_chrome_value(enc, key):
+    """Расшифровать значение cookie Chrome (v10/v11)."""
+    if not enc:
+        return ""
+    try:
+        raw = base64.b64decode(enc)
+    except Exception:
+        return ""
+    if not (raw.startswith(b"v10") or raw.startswith(b"v11")):
+        return ""
+    try:
+        dk = hashlib.pbkdf2_hmac("sha1", key, b"saltysalt", 1003, 16)
+    except Exception:
+        return ""
+    dec = openssl_decrypt_cbc(dk, raw[3:])
+    if not dec or len(dec) < 4:
+        return ""
+    value = dec  # хвост — SHA-256 от host_key (32 байта), у старых версий MD5 (16)
+    for cut in (32, 16):
+        if len(value) > cut:
+            cand = value[:-cut]
+            try:
+                text = cand.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if text and all(ch >= " " or ch in "\t\n\r" for ch in text):
+                return text
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def chrome_cookie_header():
+    base = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+    if not os.path.isdir(base):
+        return None
+    profiles = []
+    for name in sorted(os.listdir(base)):
+        if name == "Default" or name.startswith("Profile "):
+            profiles.append(os.path.join(base, name, "Cookies"))
+    if not profiles:
+        return None
+
+    # сначала читаем БД: если доступа нет (нет Full Disk Access) — не трогаем Keychain,
+    # чтобы не выскакивал диалог «security хочет использовать…»
+    rows_all = []
+    for db_path in profiles:
+        if not os.path.exists(db_path):
+            continue
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        tmp.close()
+        try:
+            shutil.copyfile(db_path, tmp.name)
+            con = sqlite3.connect("file:%s?mode=ro" % tmp.name, uri=True)
+            rows = con.execute(
+                "SELECT host_key, name, encrypted_value FROM cookies "
+                "WHERE host_key LIKE '%muse.ai' OR host_key LIKE '%meta.ai'").fetchall()
+            con.close()
+        except Exception as e:
+            log("chrome db %s: %r" % (db_path, e))
+            os.unlink(tmp.name)
+            continue
+        os.unlink(tmp.name)
+        rows_all.extend(rows)
+    if not rows_all:
+        return None
+
+    key = chrome_safe_storage_key()
+    if not key:
+        log("Chrome: нет ключа Chrome Safe Storage")
+        return None
+
+    jar = {}
+    for host, name, enc in rows_all:
+        val = decrypt_chrome_value(enc, key)
+        if val:
+            jar[name] = val
+    if not jar:
+        return None
+    log("chrome: %d cookie(s)" % len(jar))
+    return "; ".join("%s=%s" % (k, v) for k, v in jar.items())
+
+
+def safari_cookie_header():
+    # Старый путь + контейнер Safari (в т.ч. профили: WebsiteDataStore/<uuid>/Cookies)
+    paths = [os.path.expanduser("~/Library/Cookies/Cookies.binarycookies"),
+             os.path.expanduser("~/Library/Containers/com.apple.Safari/Data/"
+                                "Library/Cookies/Cookies.binarycookies")]
+    paths += sorted(glob.glob(os.path.expanduser(
+        "~/Library/Containers/com.apple.Safari/Data/Library/WebKit/"
+        "WebsiteDataStore/*/Cookies/Cookies.binarycookies")))
+    jar = {}
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            for host, name, value in parse_binarycookies(data):
+                if "muse.ai" in host or "meta.ai" in host:
+                    jar[name] = value
+        except Exception as e:
+            log("safari cookies %s: %r" % (path, e))
+    if not jar:
+        return None
+    log("safari: %d cookie(s)" % len(jar))
+    return "; ".join("%s=%s" % (k, v) for k, v in jar.items())
+
+
+def parse_binarycookies(data):
+    """Разбор Safari Cookies.binarycookies -> [(host, name, value)].
+
+    Формат: "cook", число страниц и их размеры (big-endian), затем страницы;
+    внутри страницы все поля little-endian, смещения — от начала страницы/записи,
+    строки оканчиваются нулём.
+    """
+    out = []
+    if data[:4] != b"cook":
+        return out
+    le = lambda b, o: int.from_bytes(b[o:o + 4], "little")
+    num_pages = int.from_bytes(data[4:8], "big")
+    sizes = [int.from_bytes(data[8 + i * 4:12 + i * 4], "big") for i in range(num_pages)]
+    off = 8 + num_pages * 4
+
+    def cstr(buf, o):
+        end = buf.find(b"\0", o)
+        return buf[o:end if end >= 0 else len(buf)].decode("utf-8", "replace")
+
+    for size in sizes:
+        page = data[off:off + size]
+        off += size
+        if len(page) < 8 or page[:4] != b"\x00\x00\x01\x00":
+            continue
+        for i in range(le(page, 4)):
+            rec = le(page, 8 + i * 4)
+            if rec + 32 > len(page):
+                continue
+            host = cstr(page, rec + le(page, rec + 16))
+            name = cstr(page, rec + le(page, rec + 20))
+            value = cstr(page, rec + le(page, rec + 28))
+            out.append((host, name, value))
+    return out
+
+
+def cookie_header():
+    for fn in (manual_cookie_header, chrome_cookie_header, safari_cookie_header):
+        try:
+            h = fn()
+        except Exception as e:
+            log("%s: %r" % (fn.__name__, e))
+            h = None
+        if h:
+            log("источник куки: %s" % fn.__name__)
+            return h, fn.__name__
+    return None, None
+
+
+# --------------------------------------------------------------- server action
+
+def chunk_paths(text):
+    seen = []
+    for p in re.findall(r"static/chunks/[\w~.-]+\.js", text or ""):
+        p = "/_next/" + p
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def fetch_chunks(paths):
+    bodies = []
+    for path in paths:
+        st, _h, body = request("GET", ORIGIN + path, headers={"Accept": "*/*", "User-Agent": UA})
+        if st == 200:
+            bodies.append(body)
+    return bodies
+
+
+def signed_out(status, headers):
+    if status in (401, 403):
+        return True
+    loc = headers.get("location") or headers.get("Location") or ""
+    return loc.startswith("https://auth.muse.ai/")
+
+
+def discover_action(cookie):
+    """Ищет id server action fetchSubscriptionAction в чанках Next.js."""
+    st, headers, page = request("GET", ORIGIN + "/", headers={
+        "Cookie": cookie, "Accept": "text/html", "User-Agent": UA}, follow=False)
+    if signed_out(st, headers):
+        return None
+    if st != 200:
+        raise RuntimeError("muse.ai вернул HTTP %s" % st)
+    paths = chunk_paths(page)[:96]
+    text = ""
+    for i in range(0, len(paths), 8):
+        text += "\n" + "\n".join(fetch_chunks(paths[i:i + 8]))
+        if len(text) > 8 * 1024 * 1024:
+            raise RuntimeError("слишком много чанков")
+        m = re.search(r"\.A\((\d+)\)\.then\(\(\{[^}]*Settings", text)
+        if not m:
+            continue
+        module = m.group(1)
+        lm = re.search(r"[,{\[]%s,\w+=>\{\w+\.v\(\w+=>Promise\.all\(\[([^\]]*)" % module, text)
+        if not lm:
+            continue
+        spaths = chunk_paths(lm.group(1))[:32]
+        for j in range(0, len(spaths), 8):
+            for body in fetch_chunks(spaths[j:j + 8]):
+                im = re.search(r'"([0-9a-f]{40,})",[^"]{0,200}"fetchSubscriptionAction"', body)
+                if im:
+                    return im.group(1)
+        break
+    raise RuntimeError("не нашли server action muse.ai (сайт мог измениться)")
+
+
+def post_action(cookie, action_id):
+    body = json.dumps([{"includeAgreement": True}]).encode()
+    headers = {
+        "Cookie": cookie,
+        "Accept": "text/x-component",
+        "Next-Action": action_id,
+        "Origin": ORIGIN,
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "User-Agent": UA,
+        "Content-Type": "text/plain;charset=UTF-8",
+    }
+    st, h, txt = request("POST", ORIGIN + "/", headers=headers, body=body, follow=False)
+    if st in (400, 415):
+        headers["Content-Type"] = "application/json"
+        st, h, txt = request("POST", ORIGIN + "/", headers=headers, body=body, follow=False)
+    return st, h, txt
+
+
+def parse_subscription(text):
+    sub = None
+    for line in (text or "").split("\n"):
+        m = re.match(r"^[0-9a-f]+:(\{.*\})\s*$", line)
+        if not m:
+            continue
+        try:
+            row = json.loads(m.group(1))
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("success") is True and isinstance(row.get("subscription"), dict):
+            sub = row["subscription"]
+    return sub
+
+
+def to_epoch(value):
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def main():
+    cookie, source = cookie_header()
+    if not cookie:
+        print(json.dumps({"error": "нет сессии muse.ai"}, ensure_ascii=False))
+        return 2
+
+    action_id = None
+    try:
+        with open(ACTION_CACHE) as f:
+            action_id = f.read().strip()
+    except OSError:
+        pass
+
+    st, headers, txt = post_action(cookie, action_id) if action_id else (0, {}, "")
+    stale = st == 404 and re.search(r"server action not found", txt or "", re.I)
+
+    if not action_id or stale:
+        try:
+            action_id = discover_action(cookie)
+        except Exception as e:
+            print(json.dumps({"error": str(e)}, ensure_ascii=False))
+            return 3
+        if not action_id:
+            print(json.dumps({"error": "сессия muse.ai истекла — войдите на muse.ai"}, ensure_ascii=False))
+            return 4
+        try:
+            os.makedirs(os.path.dirname(ACTION_CACHE), exist_ok=True)
+            with open(ACTION_CACHE, "w") as f:
+                f.write(action_id)
+        except OSError:
+            pass
+        st, headers, txt = post_action(cookie, action_id)
+
+    if signed_out(st, headers):
+        print(json.dumps({"error": "сессия muse.ai истекла — войдите на muse.ai"}, ensure_ascii=False))
+        return 4
+    if st != 200:
+        print(json.dumps({"error": "muse.ai вернул HTTP %s" % st}, ensure_ascii=False))
+        return 5
+
+    sub = parse_subscription(txt)
+    if not sub:
+        print(json.dumps({"error": "неожиданный ответ muse.ai"}, ensure_ascii=False))
+        return 6
+
+    usage = sub.get("usage") or {}
+    pct = usage.get("percentUsed")
+    if not isinstance(pct, (int, float)):
+        print(json.dumps({"error": "muse.ai не вернул процент"}, ensure_ascii=False))
+        return 7
+
+    def tokens_left(label):
+        m = re.search(r"\(([^()]+ tokens left)\)", label or "")
+        return m.group(1) if m else None
+
+    out = {
+        "pct": max(0, min(100, pct)),
+        "plan": (sub.get("tier") or {}).get("name") or sub.get("usageRowLabel"),
+        "resets_at": to_epoch(usage.get("resetsAt")),
+        "tokens_left": tokens_left(sub.get("usageRowValueLabel")),
+        "renews_at": to_epoch((sub.get("agreement") or {}).get("currentPeriodEndTime")),
+        "source": source,
+    }
+    bal = sub.get("topupBalance")
+    tot = sub.get("topupTotal")
+    if isinstance(bal, (int, float)) and isinstance(tot, (int, float)) and tot > 0:
+        out["topup"] = {
+            "label": sub.get("topupRowLabel") or "Доп. токены",
+            "value": tokens_left(sub.get("topupRowValueLabel")) or sub.get("topupRowValueLabel") or "$%.2f" % (bal / 1e6),
+            "pct": max(0, min(100, (tot - bal) / tot * 100)),
+        }
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

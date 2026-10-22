@@ -1,0 +1,56 @@
+#!/bin/bash
+# Помощник для входа в muse.ai (Meta Muse) и подключения к плагину.
+#
+# Что делать:
+#  1) Войти на https://muse.ai (через Meta/Facebook) в Chrome или Safari.
+#  2) Вариант А (автоматически): выдать SwiftBar и «AI Credits» доступ
+#     «Полный доступ к диску» (Системные настройки → Конфиденциальность и безопасность
+#     → Полный доступ к диску). Плагин сам прочитает cookie браузера.
+#  3) Вариант Б (вручную): скопировать Cookie-заголовок из запроса к muse.ai
+#     и сохранить его в ~/.config/ai-credits/muse.cookie
+#
+# Запуск: ai-credits-muse-cookie [--show]
+
+set -uo pipefail
+COOKIE_FILE="${AI_CREDITS_MUSE_COOKIE_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-credits/muse.cookie}"
+mkdir -p "$(dirname "$COOKIE_FILE")" 2>/dev/null
+
+open_url() { open "$1" >/dev/null 2>&1 || true; }
+
+if [ "${1:-}" = "--show" ]; then
+  if [ -f "$COOKIE_FILE" ]; then
+    # показываем только имена cookie, значения не печатаем
+    sed 's/=.*/=<скрыто>/' "$COOKIE_FILE"
+  else
+    echo "Файла $COOKIE_FILE нет."
+  fi
+  exit 0
+fi
+
+open_url "https://muse.ai/?settings_tab=general"
+
+cat <<EOF
+
+Muse (muse.ai) — что сделать:
+
+1) В открывшейся вкладке войдите на muse.ai (Meta/Facebook).
+
+2) Вариант А — автоматический:
+   Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску
+   → добавить SwiftBar и «AI Credits».
+   Плагин сам прочитает cookie из Chrome/Safari.
+
+3) Вариант Б — вручную:
+   В Chrome: F12 → Network → выберите запрос к muse.ai → правый клик →
+   Copy → Copy request headers. В строках с Cookie скопируйте только значение.
+   Safari: Разработка → Показать веб-инспектор → Сеть → запрос к muse.ai →
+   правый клик → Копировать значение заголовка Cookie.
+
+   Сохраните в файл:
+     $COOKIE_FILE
+
+   Быстрый способ — выполните в Терминале:
+     nano "$COOKIE_FILE"     (вставьте строку Cookie и сохраните)
+
+4) После этого нажмите «🔄 Обновить сейчас» в меню SwiftBar.
+EOF

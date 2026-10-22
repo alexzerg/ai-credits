@@ -1,0 +1,21 @@
+#!/bin/bash
+# Открывает конфиг плагина ai-credits в TextEdit.
+set -uo pipefail
+
+CONFIG="${AI_CREDITS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-credits/config.env}"
+mkdir -p "$(dirname "$CONFIG")"
+
+if [ ! -f "$CONFIG" ]; then
+  cat >"$CONFIG" <<'EOF'
+# Настройки плагина ai-credits (SwiftBar)
+
+# Интервал обновления в секундах (по умолчанию 600 = 10 минут).
+AI_CREDITS_TTL=600
+
+# Отладочный лог запросов: ~/.cache/ai-credits/debug.log
+# AI_CREDITS_DEBUG=1
+EOF
+fi
+
+open -e "$CONFIG"
+echo "Открыт $CONFIG"
